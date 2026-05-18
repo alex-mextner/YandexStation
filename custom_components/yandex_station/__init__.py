@@ -252,6 +252,27 @@ async def _init_local_discovery(hass: HomeAssistant):
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, listener.stop)
 
+    # Fallback: manually add local speakers for environments where mDNS/Zeroconf
+    # doesn't work (e.g. Docker bridge networks). Speakers must be reachable
+    # from the HA container via their local IP.
+    async def _add_manual_speakers(now):
+        manual_speakers = {
+            "M00ZRW3008RAJG": {"host": "192.168.0.22", "port": 1961, "platform": "yandexmini2"},
+            "M10DST310HXNPK": {"host": "192.168.0.17", "port": 1961, "platform": "yandexmini2"},
+        }
+        for device_id, info in manual_speakers.items():
+            if device_id not in speakers:
+                continue
+            speaker = speakers[device_id]
+            entity = speaker.get("entity")
+            if entity and not entity.local_state:
+                speaker.update(info)
+                await entity.init_local_mode()
+                entity.async_write_ha_state()
+
+    from homeassistant.helpers.event import async_call_later
+    async_call_later(hass, 30, _add_manual_speakers)
+
 
 async def _init_services(hass: HomeAssistant):
     """Init Yandex Station TTS service."""
