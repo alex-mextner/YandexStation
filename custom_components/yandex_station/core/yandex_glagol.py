@@ -26,12 +26,11 @@ class YandexGlagol:
     # keep_task: Task = None
     update_handler: Callable = None
 
-    waiters: Dict[str, Future] = {}
-
     def __init__(self, session: YandexSession, device: dict):
         self.session = session
         self.device = device
         self.loop = asyncio.get_event_loop()
+        self.waiters: Dict[str, Future] = {}
 
     def debug(self, text: str):
         _LOGGER.debug(f"{self.device['name']} | {text}")
@@ -110,31 +109,7 @@ class YandexGlagol:
 
                 # debug(msg.data)
 
-                request_id = data.get("requestId")
-                if request_id in self.waiters:
-                    result = {"status": data["status"]}
-
-                    if vinsResponse := data.get("vinsResponse"):
-                        try:
-                            # payload only in yandex module
-                            if payload := vinsResponse.get("payload"):
-                                response = payload["response"]
-                            else:
-                                response = vinsResponse["response"]
-
-                            if card := response.get("card"):
-                                result.update(card)
-                            elif cards := response.get("cards"):
-                                result.update(cards[0])
-                            elif is_streaming := response.get("is_streaming"):
-                                result["is_streaming"] = is_streaming
-                            elif output_speech := response.get("output_speech"):
-                                result.update(output_speech)
-
-                        except Exception as e:
-                            _LOGGER.debug(f"Response error: {e}")
-
-                    self.waiters[request_id].set_result(result)
+                self._resolve_waiter(data)
 
                 self.update_handler(data)
 
@@ -193,10 +168,42 @@ class YandexGlagol:
         except:
             pass
 
+    def _resolve_waiter(self, data: dict):
+        waiter = self.waiters.get(data.get("requestId"))
+        if waiter is None or waiter.done():
+            return
+        waiter.set_result(self._response_result(data))
+
+    @staticmethod
+    def _response_result(data: dict) -> dict:
+        result = {"status": data["status"]}
+        if not (vins_response := data.get("vinsResponse")):
+            return result
+        try:
+            # payload only in yandex module
+            if payload := vins_response.get("payload"):
+                response = payload["response"]
+            else:
+                response = vins_response["response"]
+
+            if card := response.get("card"):
+                result.update(card)
+            elif cards := response.get("cards"):
+                result.update(cards[0])
+            elif is_streaming := response.get("is_streaming"):
+                result["is_streaming"] = is_streaming
+            elif output_speech := response.get("output_speech"):
+                result.update(output_speech)
+        except Exception as e:
+            _LOGGER.debug(f"Response error: {e}")
+        return result
+
     async def send(self, payload: dict) -> Optional[dict]:
         _LOGGER.debug(f"{self.name} => local | {payload}")
 
         request_id = str(uuid.uuid4())
+        waiter = self.loop.create_future()
+        self.waiters[request_id] = waiter
 
         try:
             await self.ws.send_json(
@@ -208,22 +215,25 @@ class YandexGlagol:
                 }
             )
 
-            self.waiters[request_id] = self.loop.create_future()
-
             # limit future wait time
-            await asyncio.wait_for(self.waiters[request_id], 5)
+            result = await asyncio.wait_for(waiter, 5)
 
             # self.next_ping_ts = time.time() + 0.5
 
-            return self.waiters.pop(request_id).result()
+            return result
 
         except asyncio.TimeoutError as e:
-            _ = self.waiters.pop(request_id, None)
             return {"error": repr(e)}
 
         except Exception as e:
             _LOGGER.error(f"{self.name} => local | {repr(e)}")
             return {"error": repr(e)}
+
+        finally:
+            if self.waiters.get(request_id) is waiter:
+                self.waiters.pop(request_id)
+            if not waiter.done():
+                waiter.cancel()
 
     async def reset_session(self):
         payload = {
